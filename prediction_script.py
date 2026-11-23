@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 Pks13 Inhibitor Prediction:
-    Input: Csv file with SMILES column (input.csv)
-    Output: Folder (result) containing prediction file and image folders
+    Input: Csv file with SMILES column
+    Output: Prediction file and Image folder
 """
 
 import os
@@ -20,15 +20,17 @@ from Smiles_to_graph import smiles_to_graph
 from torch_geometric.explain import Explainer, GNNExplainer
 
 # ---------------- CONFIG ---------------- #
-INPUT_CSV = "input.csv"
+INPUT_CSV = "smiles.csv"
 MODEL_PATH = "gnn_model.pt"
-OUT_DIR = "result"
+OUT_DIR = "results"
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 BATCH_SIZE = 16   # safer for stability
 TOP_K = 10
 THRESHOLD = 0.5
+GNN_EXPLAINER_EPOCHS = 300
+GNN_EXPLAINER_SEED = 42
 
 CLASS_MAP = {0: "Non-Inhibitor", 1: "Inhibitor"}
 
@@ -80,14 +82,11 @@ class WrappedModel(torch.nn.Module):
     def forward(self, x, edge_index, edge_attr, batch):
         out, _ = self.model(x, edge_index, edge_attr, batch)
         return out
-# ---------------- LOAD MODEL ---------------- #
+
 checkpoint = torch.load(MODEL_PATH, map_location=DEVICE)
 
-base_model = EdgeAwareGCNNet(
-    in_channels=checkpoint["in_channels"],
-    edge_dim=checkpoint["edge_dim"],
-    hidden_dim=checkpoint["hidden_dim"]
-).to(DEVICE)
+base_model = EdgeAwareGCNNet(in_channels=checkpoint["in_channels"],edge_dim=checkpoint["edge_dim"],
+    hidden_dim=checkpoint["hidden_dim"]).to(DEVICE)
 
 base_model.load_state_dict(checkpoint["model_state_dict"])
 base_model.eval()
@@ -96,52 +95,37 @@ model = WrappedModel(base_model).to(DEVICE)  # for GNNExplainer
 model.eval()
 
 
-explainer = Explainer(
-    model=model,
-    algorithm=GNNExplainer(epochs=100),  # keep moderate for speed
-    explanation_type='model',
-    node_mask_type='attributes',
+explainer = Explainer(model=model,algorithm=GNNExplainer(epochs=GNN_EXPLAINER_EPOCHS),
+    explanation_type='model',node_mask_type='object',  # one learned scalar per atom
     edge_mask_type='object',
-    model_config=dict(
-        mode='binary_classification',
-        task_level='graph',
-        return_type='raw',
-    ),
-)
+    model_config=dict(mode='binary_classification',task_level='graph',return_type='raw',),)
 
 feature_mean = checkpoint["feature_mean"]
 feature_std = checkpoint["feature_std"]
-
 print("Model loaded successfully")
 
 
-# ---------------- LOAD DATA ---------------- #
 df = pd.read_csv(INPUT_CSV)
-
 if "SMILES" not in df.columns:
     raise ValueError("CSV must contain 'SMILES' column")
 
 df = df.reset_index(drop=True)
 smiles_list = df["SMILES"].tolist()
-
 graphs = []
 valid_smiles = []
 
 for s in smiles_list:
     g = smiles_to_graph(s, 0.0)
     if g is not None:
-        g.smiles = s  # IMPORTANT
+        g.smiles = s  
         graphs.append(g)
         valid_smiles.append(s)
 
-# Normalize
 for g in graphs:
     g.x = (g.x - feature_mean) / feature_std
 
 print(f"Valid molecules: {len(graphs)}")
 
-
-# ---------------- MAIN INFERENCE ---------------- #
 def run_inference(model, dataset):
     loader = PyGDataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)
 
@@ -162,6 +146,7 @@ def run_inference(model, dataset):
             probs = torch.sigmoid(out).view(-1).cpu().numpy()
             preds = (probs > THRESHOLD).astype(int)
 
+        # ---- Grad-CAM ----
         scores = compute_grad_cam_for_batch(base_model, batch, target_class=1)
         data_list = batch.to_data_list()
 
@@ -181,32 +166,43 @@ def run_inference(model, dataset):
                 gcam_top_atoms = idxs.tolist()
                 gcam_atom_scores = [float(gcam[x]) for x in gcam_top_atoms]
 
-##-------------- GNNExplainer----------------#
+            # ---------------- GNNExplainer: OBJECT-LEVEL ATOM MASK ---------------- #
+            torch.manual_seed(GNN_EXPLAINER_SEED + idx_global)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(GNN_EXPLAINER_SEED + idx_global)
             explanation = explainer(
                 x=data.x,
                 edge_index=data.edge_index,
                 edge_attr=data.edge_attr,
-                batch=torch.zeros(data.x.size(0), dtype=torch.long).to(data.x.device)
-                )
+                batch=torch.zeros(data.x.size(0), dtype=torch.long,device=data.x.device),)
             node_mask = explanation.node_mask
-            
+            edge_mask = explanation.edge_mask
+
             if node_mask is None:
                 gnn_top_atoms, gnn_scores = [], []
+                gnn_all_scores = []
             else:
-                node_mask = node_mask.detach().cpu().numpy()
-                # ---- FIX: reduce feature dimension ---- #
-                if node_mask.ndim == 2:
-                    #node_importance = node_mask.mean(axis=1)   # or sum(axis=1)
-                    node_importance = np.linalg.norm(node_mask, axis=1)
-                else:
-                    node_importance = node_mask
-                
+                node_importance = node_mask.detach().cpu().numpy().reshape(-1)
+                if node_importance.size != data.x.size(0):
+                    raise ValueError(
+                        f'Expected {data.x.size(0)} object-mask scores, '
+                        f'got {node_importance.size} for {smiles}'
+                    )
+                if not np.isfinite(node_importance).all():
+                    raise ValueError(f'Non-finite GNNExplainer mask for {smiles}')
+
                 k = min(TOP_K, len(node_importance))
-                idxs = np.argsort(node_importance)[-k:][::-1]
-                
+                # Stable tie handling: lowest atom index first.
+                idxs = np.argsort(-node_importance, kind='stable')[:k]
                 gnn_top_atoms = idxs.tolist()
-                gnn_scores = [float(node_importance[x]) for x in gnn_top_atoms]
-                
+                gnn_scores = node_importance[idxs].astype(float).tolist()
+                gnn_all_scores = node_importance.astype(float).tolist()
+
+            edge_scores = (
+                edge_mask.detach().cpu().numpy().reshape(-1).astype(float).tolist()
+                if edge_mask is not None else []
+            )
+
             mol = Chem.MolFromSmiles(smiles)
             if mol:
                 gcam_atom_labels = [mol.GetAtomWithIdx(x).GetSymbol() for x in gcam_top_atoms]
@@ -233,29 +229,28 @@ def run_inference(model, dataset):
                 "GCAM_Top_Atoms": ";".join(map(str, gcam_top_atoms)),
                 "GCAM_Atom_Scores": ";".join([f"{x:.4f}" for x in gcam_atom_scores]),
                 "GCAM_Atom_Labels": ";".join(gcam_atom_labels),
-
-                "GCAM_Image_Path": img_path,
-                
+                "GCAM_Image_Path": img_path,              
                 # GNNExplainer
                 "GNN_Top_Atoms": ";".join(map(str, gnn_top_atoms)),
-                "GNN_Scores": ";".join([f"{x:.4f}" for x in gnn_scores]),
+                "GNN_Scores": ";".join([f"{x:.6f}" for x in gnn_scores]),
+                "GNN_All_Atom_Scores": ";".join([f"{x:.6f}" for x in gnn_all_scores]),
+                "GNN_All_Edge_Mask_Scores": ";".join([f"{x:.6f}" for x in edge_scores]),
+                "GNN_Mask_Type": "object",
+                "GNN_Explainer_Epochs": GNN_EXPLAINER_EPOCHS,
+                "GNN_Explainer_Seed": GNN_EXPLAINER_SEED + idx_global,
                 "GNN_Atom_Labels": ";".join(gnn_atom_labels),
                 "GNN_Image_Path": gnnexp_img_path,
-                "Overlap_Atoms": ";".join(map(str, set(gcam_top_atoms) & set(gnn_top_atoms)))
+                "Overlap_Atoms": ";".join(map(str, sorted(set(gcam_top_atoms) & set(gnn_top_atoms))))
             })
 
             idx_global += 1
 
     return pd.DataFrame(results)
 
-
-# ---------------- RUN ---------------- #
 print("Running inference...")
 results_df = run_inference(model, graphs)
 
-# ---------------- SAVE ---------------- #
 output_csv = os.path.join(OUT_DIR, "predictions_with_gradcam.csv")
 results_df.to_csv(output_csv, index=False)
 
-print("DONE")
 print(f"Results saved at: {output_csv}")
